@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Electric Load Forecasting utilizing Data Mining Techniques</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      margin: 0;
+      padding: 0;
+      background: linear-gradient(to right, #b0b7bd, #d9e2ec);
+    }
+    header {
+      text-align: center;
+      padding: 2em 1em;
+      background: rgba(249, 233, 250, 0.8);
+    }
+    header h1 {
+      margin: 0;
+      font-size: 2.5em;
+      color: #333;
+    }
+    header p {
+        font-size: 1em;     
+        color: #000000;
+        margin-top: 0.5em;
+        text-align: left;  
+    }
+    #controls {
+      padding: 1em;
+      background: #ffffffcc;
+      display: flex;
+      gap: 1em;
+      align-items: center;
+      flex-wrap: wrap;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    #scatter, #forecast {
+      width: 100%;
+      height: 500px;
+      margin-top: 1em;
+    }
+    label {
+      font-size: 0.9em;
+    }
+    input, select {
+      margin-left: 0.3em;
+    }
+    #cluster-info {
+      background: rgba(249, 233, 250, 0.8);
+      margin: 1em;
+      padding: 1em;
+      border-radius: 4px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+      font-size: 1em;
+      color: #333;
+    }
+    #cluster-info h2 {
+      margin-top: 0;
+      font-size: 1.4em;
+      color: #444;
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <h1>Electric Load Forecasting utilizing Data Mining Techniques</h1>
+    <p>This dashboard designed to help you uncover patterns and evaluate forecasting models for hourly electricity demand across ten major U.S. cities. </p>
+    <p> At its core, the dashboard uses principal-component analysis and K-means clustering to distill weather and demand features into two dimensions—letting you instantly spot cooler, lower-usage periods versus hotter, peak-demand events. Below that, a forecasting panel compares four approaches (naïve persistence, Random Forest, XGBoost, and a stacked ensemble) over the first 48 hours, with a dropdown to switch seamlessly between cities.  </p>
+    <p> Use the controls to filter by city, date range, clustering granularity, or toggle clustering on and off; hover over any point to see exact PCA coordinates, and watch the forecast curves update in real time. </p>
+
+  </header>
+
+  <div id="controls">
+    <label>
+      City:
+      <select id="city-select">
+        <option value="">All Cities</option>
+        <option value="seattle">Seattle</option>
+        <option value="nyc">NYC</option>
+        <option value="la">LA</option>
+        <option value="san diego">San Diego</option>
+        <option value="san antonio">San Antonio</option>
+        <option value="san jose">San Jose</option>
+        <option value="philadelphia">Philadelphia</option>
+        <option value="phoenix">Phoenix</option>
+        <option value="houston">Houston</option>
+        <option value="dallas">Dallas</option>
+      </select>
+    </label>
+
+    <label>
+      Date range:
+      <input type="date" id="start-date">
+      –
+      <input type="date" id="end-date">
+    </label>
+
+    <label>
+      Look-back window:
+      <input type="number" id="window-size" value="24" min="1" max="168">
+    </label>
+
+    <label>
+      Number of clusters (k):
+      <input type="range" id="k-slider" min="2" max="8" value="3">
+      <span id="k-value">3</span>
+    </label>
+
+    <label>
+      <input type="checkbox" id="model-toggle" checked>
+      Show clustering
+    </label>
+  </div>
+
+  <div id="scatter"></div>
+
+  <div id="cluster-info">
+    <h2>Cluster Interpretations</h2>
+  </div>
+
+  <div id="forecast"></div>
+
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+  <script>
+    let rawData, forecastData;
+
+    // Load both PCA cluster and forecast CSVs
+    Promise.all([
+      d3.csv('pca_clusters.csv', d => ({
+        pc1:      +d.PC1,
+        pc2:      +d.PC2,
+        cluster:  +d.cluster,
+        city:      d.city,
+        timestamp: new Date(d.timestamp)
+      })),
+      d3.csv('forecast.csv', d => ({
+        timestamp:        new Date(d.timestamp),
+        city:             d.city,
+        actual:           +d.target,
+        naive:            +d.naive,
+        rf:               +d.rf_pred,
+        xgb:              +d.xgb_pred,
+        stack:            +d.stack_pred
+      }))
+    ]).then(([pcaData, fcData]) => {
+      rawData = pcaData;
+      forecastData = fcData;
+      initApp();
+    });
+
+    function initApp() {
+      // auto-fill date inputs from PCA data
+      const times = rawData.map(d => d.timestamp);
+      const fmt = d3.timeFormat('%Y-%m-%d');
+      d3.select('#start-date').property('value', fmt(d3.min(times)));
+      d3.select('#end-date').property('value',   fmt(d3.max(times)));
+
+      setupControls();
+      renderScatter();
+      renderForecast();
+    }
+
+    function getFilters() {
+      const cityFilter = d3.select('#city-select').property('value');
+      const startVal   = d3.select('#start-date').property('value');
+      const endVal     = d3.select('#end-date').property('value');
+      const kVal       = +d3.select('#k-slider').property('value');
+      const showCls    = d3.select('#model-toggle').property('checked');
+      d3.select('#k-value').text(kVal);
+      return {
+        cityFilter,
+        startDt: startVal ? new Date(startVal) : null,
+        endDt:   endVal   ? new Date(endVal)   : null,
+        kVal,
+        showCls
+      };
+    }
+
+    function renderScatter() {
+      const { cityFilter, startDt, endDt, kVal, showCls } = getFilters();
+      const pts = rawData.filter(d => {
+        if (cityFilter && d.city !== cityFilter) return false;
+        if (startDt && d.timestamp < startDt)      return false;
+        if (endDt   && d.timestamp > endDt)        return false;
+        if (d.cluster >= kVal)                     return false;
+        return true;
+      });
+      const palette = ['#ffe4f0','#ffb3d9','#ff80bf','#ff4dac','#ff1a92','#e60073','#b30059','#80003f'];
+      const clusters = [...new Set(pts.map(d => d.cluster))].sort();
+      const traces = clusters.map((cid,i) => ({
+        x: pts.filter(d=>d.cluster===cid).map(d=>d.pc1),
+        y: pts.filter(d=>d.cluster===cid).map(d=>d.pc2),
+        mode:'markers', type:'scatter', name:`Cluster ${cid}`,
+        marker:{color: showCls?palette[i]:'#999', size:6, opacity:0.7},
+        hovertemplate:`Cluster ${cid}<br>PC1: %{x:.2f}<br>PC2: %{y:.2f}<extra></extra>`
+      }));
+      Plotly.react('scatter', traces, {
+        title:'PCA Projection by Cluster', xaxis:{title:'PC1'}, yaxis:{title:'PC2'}, margin:{l:50,r:20,t:40,b:50}, height:500
+      }, {responsive:true});
+
+      // update cluster descriptions
+      const desc = {
+        0: 'Lower demand with slightly higher pressure and minimal precipitation—typical of cool, dry hours (e.g., early mornings or clear nights).',
+        1: 'High temperature and peak electricity use during clear, warm afternoons, with lower humidity and pressure.',
+        2: 'Elevated humidity and precipitation metrics with moderate wind, reflecting wet, overcast periods and below‑average electricity consumption.'
+      };
+      const info = clusters.map(cid => `<p><strong>Cluster ${cid}:</strong> ${desc[cid]||'No description.'}</p>`).join('');
+      document.getElementById('cluster-info').innerHTML = `<h2>Cluster Interpretations</h2>${info}`;
+    }
+
+    function renderForecast() {
+      const { cityFilter, startDt, endDt } = getFilters();
+      // prepare first-48h subset per city
+      const cities = [...new Set(forecastData.map(d=>d.city))];
+      const cityMax = {};
+      cities.forEach(city => {
+        const arr = forecastData
+          .filter(d=>d.city===city)
+          .filter(d=>d.timestamp >= parseDate(d3.select('#start-date').property('value')))
+          .filter(d=>d.timestamp <= parseDate(d3.select('#end-date').property('value')))
+          .sort((a,b)=>a.timestamp-b.timestamp)
+          .slice(0,48);
+        const m = d3.max(arr.flatMap(d=>[d.actual,d.naive,d.rf,d.xgb,d.stack]));
+        cityMax[city] = m*1.05;
+      });
+      // build traces
+      const data = [];
+      cities.forEach((city,i) => {
+        const arr = forecastData.filter(d=>d.city===city)
+          .sort((a,b)=>a.timestamp-b.timestamp).slice(0,48);
+        const baseVisible = i===0;
+        ['actual','naive','rf','xgb','stack'].forEach((key,j)=>{
+          data.push({
+            x: arr.map(d=>d.timestamp), y: arr.map(d=>d[key]),
+            mode:'lines+markers', name: key.charAt(0).toUpperCase()+key.slice(1),
+            visible: baseVisible,
+            line: {dash: (key==='naive'?'dash': key==='rf'?'dot': key==='xgb'?'dashdot':'solid')},
+            marker: {symbol: (key==='rf'?'square':key==='xgb'?'x':key==='stack'?'triangle-up':'circle'), size:6}
+          });
+        });
+      });
+      // dropdown buttons
+      const buttons = cities.map((city,i)=>{
+        const vis = data.map((_,idx)=> Math.floor(idx/5)===i);
+        return {
+          label: city.charAt(0).toUpperCase()+city.slice(1),
+          method:'update',
+          args:[{visible: vis},{
+            title: `${city.charAt(0).toUpperCase()+city.slice(1)}: First 48h Actual vs Predictions`,
+            yaxis:{range:[0,cityMax[city]]}
+          }]
+        };
+      });
+      // layout
+      const layout = {
+        updatemenus:[{active:0, buttons:buttons, x:0.1, y:1.15}],
+        title:cities.length?`${cities[0].charAt(0).toUpperCase()+cities[0].slice(1)}: First 48h Actual vs Predictions`:'',
+        xaxis:{title:'Timestamp'}, yaxis:{title:'Hourly Demand (MWh)'},
+        legend:{orientation:'h', yanchor:'bottom', y:1.02, xanchor:'center', x:0.5}, margin:{t:100,b:50}, height:500
+      };
+      Plotly.react('forecast', data, layout, {responsive:true});
+    }
+
+    function setupControls() {
+      d3.selectAll('#city-select, #start-date, #end-date, #k-slider, #model-toggle')
+        .on('input', () => { renderScatter(); renderForecast(); });
+    }
+
+    function parseDate(str) {
+      return str ? new Date(str) : null;
+    }
+  </script>
+
+</body>
+</html>
